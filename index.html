@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Crystal Runner Pro - WebXR Game</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body { 
+      margin: 0; overflow: hidden; font-family: 'Segoe UI', Tahoma, sans-serif;
+      background: linear-gradient(135deg, #0f2027, #203a43, #2c5364);
+    }
+    #overlay {
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 1;
+    }
+    #start-button {
+      width: 100%; height: 100%; font-size: 60px; color: white; border: none;
+      background: linear-gradient(135deg, rgba(72, 118, 255, 0.8), rgba(100, 80, 255, 0.9));
+      box-shadow: inset 0 0 50px rgba(0,0,0,0.2); cursor: pointer; transition: 0.3s;
+    }
+    #start-button:hover:not(:disabled) { background: linear-gradient(135deg, rgba(72, 118, 255, 0.9), rgba(100, 80, 255, 1.0)); }
+    #start-button:disabled {
+      background: linear-gradient(135deg, rgba(80, 80, 80, 0.8), rgba(100, 100, 100, 0.9));
+      cursor: not-allowed;
+    }
+    #status {
+      position: absolute; top: 20px; left: 20px; background: rgba(10, 20, 30, 0.6);
+      color: white; padding: 12px 18px; border-radius: 12px; backdrop-filter: blur(8px);
+      border: 1px solid rgba(255,255,255,0.1); visibility: hidden; 
+    }
+    .exit-ar { 
+      position: fixed; top: 20px; right: 20px; background: rgba(255, 255, 255, 0.25);
+      color: white; border: none; border-radius: 50%; width: 50px; height: 50px;
+      font-size: 24px; cursor: pointer; backdrop-filter: blur(5px); z-index: 1000; display: none;
+    }
+    .xr-active .exit-ar { display: flex; }
+    .webxr-hidden { display: none !important; }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.150.1/build/three.module.js",
+        "GLTFLoader": "https://cdn.jsdelivr.net/npm/three@0.150.1/examples/jsm/loaders/GLTFLoader.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="overlay">
+    <button id="start-button" disabled>LOADING...</button>
+    <div id="status"></div>
+  </div>
+  <button class="exit-ar" id="exit-ar">×</button>
+  
+  <audio id="death-sound" preload="auto" src="dead.mp3"></audio>
+  <audio id="glass-break-sound" preload="auto" src="minecraft-glass-break.mp3"></audio>
+  
+  <script type="module">
+    import * as THREE from 'three';
+    import { GLTFLoader } from 'GLTFLoader';
+
+    // --- GAME STATE ---
+    const state = {
+      xrSession: null, isPlaying: false, isControllerSelection: false, isFirstRun: true,
+      lives: 3, score: 0, speed: 2.0, baseSpeed: 2.0, spawnInterval: 2.0, lastSpawn: 0,
+      lane: 1, clock: new THREE.Clock(), gameStartTime: 0,
+      selectedCtrlIdx: 0, ctrlHoldStart: {}, activeController: null
+    };
+
+    const CONSTANTS = {
+      lanes: [-0.4, 0, 0.4],
+      colors: [0x84f7fd, 0x64acff, 0xa864ff, 0x45caff],
+      selectTime: 15000, holdTime: 4000, clapDist: 0.15, clapTime: 2000,
+      learnTime: 10, restartTime: 2, maxObstacles: 8
+    };
+
+    // --- GLOBALS ---
+    let camera, scene, renderer, gltfLoader, backgroundMusic;
+    let player, ground, scorePanel, crystalsText, livesText;
+    let controllers = [], obstacles = [], pool = [], envObjects = [];
+    let particles = [], particlePool = []; 
+    let gemDataList = []; 
+    let lastRot = new THREE.Euler(), clapStart = 0;
+    const _euler = new THREE.Euler(); 
+    
+    // New Globals for the Bad Element
+    let badGemGeo, badGemMat;
+
+    init();
+
+    function init() {
+      // Scene Setup
+      scene = new THREE.Scene();
+      scene.fog = new THREE.FogExp2(0x001133, 0.08);
+      camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.01, 20);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: "high-performance" });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.xr.enabled = true;
+      renderer.setClearColor(0x000000, 0);
+      renderer.outputEncoding = THREE.sRGBEncoding;
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 1.1;
+      document.body.appendChild(renderer.domElement);
+
+      // Lighting - Optimized Hemisphere for better PBR reflections
+      scene.add(new THREE.AmbientLight(0xffffff, 0.4));
+      const hemiLight = new THREE.HemisphereLight(0xffffff, 0x444477, 1.2);
+      hemiLight.position.set(0, 5, 0);
+      scene.add(hemiLight);
+      
+      const dirLight = new THREE.DirectionalLight(0xaaccff, 1.5);
+      dirLight.position.set(1, 2, 1);
+      scene.add(dirLight);
+
+      // --- BAD ELEMENT SETUP (Low Poly, High Performance) ---
+      // Octahedron looks like a jagged diamond/crystal
+      badGemGeo = new THREE.OctahedronGeometry(0.08, 0); 
+      badGemGeo.scale(1, 1.4, 1); // Make it slightly taller
+      badGemMat = new THREE.MeshStandardMaterial({
+        color: 0x110000,
+        emissive: 0xff0022, // Glowing red
+        emissiveIntensity: 0.8,
+        roughness: 0.7,
+        metalness: 0.3
+      });
+
+      // Pre-allocate Memory for FX Particles
+      const pGeo = new THREE.SphereGeometry(1, 8, 8);
+      const pMat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.7, color: 0xffffff });
+      for(let i = 0; i < 150; i++) {
+          const m = new THREE.Mesh(pGeo, pMat.clone());
+          m.visible = false;
+          scene.add(m); 
+          particlePool.push({ mesh: m, active: false, life: 0, vel: new THREE.Vector3() });
+      }
+
+      gltfLoader = new GLTFLoader();
+      
+      loadGemModels().then(() => {
+          const startBtn = document.getElementById('start-button');
+          startBtn.innerText = '▶';
+          startBtn.style.fontSize = '120px';
+          startBtn.disabled = false;
+          startBtn.addEventListener('click', startAR);
+      });
+
+      backgroundMusic = new Audio('Gentlelane.mp3');
+      backgroundMusic.loop = true; backgroundMusic.volume = 0.7;
+
+      document.getElementById('exit-ar').addEventListener('click', endAR);
+      window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+    }
+
+    async function loadGemModels() {
+      const gems = [
+        { file: 'gem1.glb', scale: 0.144 },
+        { file: 'gem2.glb', scale: 0.0300 },
+        { file: 'gem5.glb', scale: 0.00900 }
+      ];
+      
+      const promises = gems.map(g => {
+          return new Promise((res, rej) => gltfLoader.load(g.file, res, undefined, rej))
+            .then(gltf => {
+              gltf.scene.traverse(child => {
+                if (child.isMesh && !gemDataList.find(d => d.scale === g.scale)) {
+                  const niceMat = new THREE.MeshStandardMaterial({
+                    color: child.material.color || new THREE.Color(0xffffff),
+                    map: child.material.map,
+                    metalness: 0.8,
+                    roughness: 0.2,
+                    emissive: child.material.color || new THREE.Color(0x3a70ff),
+                    emissiveIntensity: 0.5
+                  });
+                  gemDataList.push({ geometry: child.geometry, material: niceMat, scale: g.scale });
+                }
+              });
+            })
+            .catch(e => console.warn(`Skipping ${g.file}:`, e));
+      });
+      await Promise.all(promises);
+    }
+
+    // --- XR SESSION ---
+    async function startAR() {
+      if (!navigator.xr) return;
+      try {
+        const session = await navigator.xr.requestSession('immersive-ar', {
+          requiredFeatures: ['hit-test'], optionalFeatures: ['dom-overlay'], domOverlay: { root: document.body }
+        });
+        document.getElementById('overlay').classList.add('webxr-hidden');
+        document.body.classList.add('xr-active');
+        
+        renderer.xr.setReferenceSpaceType('local');
+        renderer.xr.setSession(session);
+        state.xrSession = session;
+        
+        buildWorld();
+        setupControllers(session);
+        preloadObstacles();
+
+        renderer.compile(scene, camera);
+
+        state.isControllerSelection = true;
+        state.gameStartTime = state.clock.getElapsedTime();
+        
+        renderer.setAnimationLoop(render);
+        session.addEventListener('end', endAR);
+      } catch (e) { console.error("XR Error:", e); }
+    }
+
+    function endAR() {
+      if(state.xrSession) state.xrSession.end();
+      state.isPlaying = state.isControllerSelection = false;
+      document.body.classList.remove('xr-active');
+      document.getElementById('overlay').classList.remove('webxr-hidden');
+      
+      backgroundMusic.pause(); backgroundMusic.currentTime = 0;
+      clearScene();
+      renderer.setAnimationLoop(null);
+      state.xrSession = null;
+    }
+
+    // --- WORLD BUILDING ---
+    function buildWorld() {
+      ground = new THREE.Mesh(
+        new THREE.BoxGeometry(2.0, 0.02, 15),
+        new THREE.MeshStandardMaterial({ color: 0x0f1a24, metalness: 0.6, roughness: 0.4 })
+      );
+      ground.position.set(0, -0.5, -7);
+      scene.add(ground); envObjects.push(ground);
+
+      for (let i = 0; i < 3; i++) {
+        const lm = new THREE.Mesh(
+          new THREE.BoxGeometry(0.02, 0.03, 15),
+          new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0x3a70ff, emissiveIntensity: 1.5 })
+        );
+        lm.position.set(CONSTANTS.lanes[i], -0.48, -7);
+        scene.add(lm); envObjects.push(lm);
+      }
+
+      const envGeom = new THREE.IcosahedronGeometry(1, 0);
+      const envMat = new THREE.MeshStandardMaterial({
+        color: 0xffffff, metalness: 0.8, roughness: 0.1, emissive: 0xffffff, emissiveIntensity: 0.2
+      });
+      const envInstanced = new THREE.InstancedMesh(envGeom, envMat, 40);
+      const dummy = new THREE.Object3D();
+      const colorObj = new THREE.Color();
+      
+      for (let i = 0; i < 40; i++) {
+        const size = 0.03 + Math.random() * 0.06;
+        const side = Math.random() > 0.5 ? 1 : -1;
+        dummy.position.set(side * 0.8 + (Math.random() * 0.3 * side), -0.48 + size / 2, -2 - i * 0.4);
+        dummy.scale.setScalar(size);
+        dummy.rotation.set(Math.random()*Math.PI, Math.random()*Math.PI, 0);
+        dummy.updateMatrix();
+        envInstanced.setMatrixAt(i, dummy.matrix);
+        
+        colorObj.setHex(CONSTANTS.colors[Math.floor(Math.random() * CONSTANTS.colors.length)]);
+        envInstanced.setColorAt(i, colorObj);
+      }
+      envInstanced.instanceMatrix.needsUpdate = true;
+      envInstanced.instanceColor.needsUpdate = true;
+      scene.add(envInstanced);
+      envObjects.push(envInstanced);
+
+      player = new THREE.Group();
+      const bubbleMat = new THREE.MeshPhysicalMaterial({
+        color: 0x4da6ff, transmission: 0.9, opacity: 1, metalness: 0.1, roughness: 0.1, ior: 1.5, side: THREE.DoubleSide
+      });
+      player.add(new THREE.Mesh(new THREE.SphereGeometry(0.12, 32, 32), bubbleMat));
+      
+      const hl = new THREE.Mesh(new THREE.SphereGeometry(0.04, 8, 8), new THREE.MeshBasicMaterial({ color: 0x87ceeb, transparent: true, opacity: 0.6 }));
+      hl.position.set(-0.05, 0.05, 0.08); player.add(hl);
+      player.position.set(CONSTANTS.lanes[1], -0.2, -2);
+      scene.add(player);
+
+      buildUI();
+      
+      for (let i = 0; i < 50; i++) {
+        const p = new THREE.Mesh(
+          new THREE.SphereGeometry(0.01 + Math.random()*0.02, 8, 8),
+          new THREE.MeshBasicMaterial({ color: CONSTANTS.colors[i % 4], transparent: true, opacity: 0.6 })
+        );
+        p.position.set((Math.random()-0.5)*3, Math.random()*1, -Math.random()*15);
+        scene.add(p); particles.push(p);
+      }
+    }
+
+    // --- UI SYSTEM ---
+    function createTextTex(text, color) {
+      const cvs = document.createElement('canvas'); cvs.width = 512; cvs.height = 128;
+      const ctx = cvs.getContext('2d');
+      ctx.fillStyle = 'rgba(0,0,0,0.8)'; ctx.fillRect(0,0,cvs.width,cvs.height);
+      ctx.strokeStyle = 'rgba(255,255,255,0.3)'; ctx.lineWidth = 2; ctx.strokeRect(2,2,cvs.width-4,cvs.height-4);
+      ctx.fillStyle = color; ctx.font = 'bold 42px Arial'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(text, cvs.width/2, cvs.height/2);
+      return new THREE.CanvasTexture(cvs);
+    }
+
+    function buildUI() {
+      scorePanel = new THREE.Group(); scorePanel.position.set(1.0, 0.3, -1.5);
+      
+      crystalsText = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 0.3), new THREE.MeshBasicMaterial({ map: createTextTex('💎 0', '#ffdd00'), transparent: true }));
+      crystalsText.position.y = 0.2; scorePanel.add(crystalsText);
+      
+      livesText = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 0.3), new THREE.MeshBasicMaterial({ map: createTextTex('❤❤❤', '#ff4444'), transparent: true }));
+      livesText.position.y = -0.2; scorePanel.add(livesText);
+      
+      scene.add(scorePanel);
+    }
+
+    function updateUI() {
+      crystalsText.material.map = createTextTex(`💎 ${state.score}`, '#ffdd00');
+      livesText.material.map = createTextTex('❤'.repeat(Math.max(0, state.lives)) + '🖤'.repeat(Math.max(0, 3 - state.lives)), '#ff4444');
+    }
+
+    // --- CONTROLLERS & INPUT ---
+    function setupControllers(session) {
+      controllers = [renderer.xr.getController(0), renderer.xr.getController(1)];
+      controllers.forEach((c, i) => {
+        scene.add(c);
+        c.addEventListener('selectstart', () => { state.ctrlPressStart = Date.now(); });
+        c.addEventListener('selectend', () => {
+          if (Date.now() - state.ctrlPressStart >= 3000) {
+            state.selectedCtrlIdx = state.selectedCtrlIdx === 0 ? 1 : 0;
+            state.activeController = controllers[state.selectedCtrlIdx];
+            triggerConfetti(state.activeController);
+          }
+        });
+      });
+    }
+
+    function processControllerSelection() {
+      if (!state.isControllerSelection) return;
+      const elapsed = (state.clock.getElapsedTime() - state.gameStartTime) * 1000;
+      
+      let highestY = -999, highestIdx = -1;
+      controllers.forEach((c, i) => { if (c.visible && c.position.y > highestY) { highestY = c.position.y; highestIdx = i; }});
+
+      if (highestIdx >= 0) {
+        const c = controllers[highestIdx];
+        const isInFront = c.position.z > -0.8 && c.position.z < -0.3 && Math.abs(c.position.x) < 0.3;
+        
+        if (isInFront) {
+          if (!state.ctrlHoldStart[highestIdx]) state.ctrlHoldStart[highestIdx] = state.clock.getElapsedTime();
+          if ((state.clock.getElapsedTime() - state.ctrlHoldStart[highestIdx]) * 1000 >= CONSTANTS.holdTime) {
+            confirmController(highestIdx); return;
+          }
+        } else state.ctrlHoldStart[highestIdx] = null;
+      }
+
+      if (elapsed > CONSTANTS.selectTime) confirmController(Math.max(0, highestIdx));
+    }
+
+    function confirmController(idx) {
+      state.isControllerSelection = false;
+      state.selectedCtrlIdx = idx;
+      state.activeController = controllers[idx];
+      triggerConfetti(state.activeController);
+      document.getElementById('death-sound').play().catch(()=>{});
+      backgroundMusic.play().catch(()=>{});
+      
+      state.isPlaying = true;
+      state.gameStartTime = state.clock.getElapsedTime(); 
+    }
+
+    function checkClap() {
+      if (controllers.length < 2 || !controllers[0].visible || !controllers[1].visible) { clapStart = 0; return; }
+      if (controllers[0].position.distanceTo(controllers[1].position) <= CONSTANTS.clapDist) {
+        if (!clapStart) clapStart = Date.now();
+        else if (Date.now() - clapStart >= CONSTANTS.clapTime) endAR();
+      } else clapStart = 0;
+    }
+
+    function handleSteering() {
+      if (!state.activeController || !state.isPlaying) return;
+      _euler.setFromQuaternion(state.activeController.quaternion); 
+      const diff = _euler.z - lastRot.z;
+      
+      if (Math.abs(diff) > 0.08) {
+        let newLane = diff > 0 ? Math.min(state.lane + 1, 2) : Math.max(state.lane - 1, 0);
+        if (state.lane !== 1 && newLane === 1 && Math.abs(diff) <= 0.08 - 0.15) newLane = state.lane; 
+        
+        if (newLane !== state.lane) {
+          state.lane = newLane;
+          createTrail(player.position, 10);
+        }
+      }
+      
+      const tx = CONSTANTS.lanes[state.lane];
+      player.position.x += (tx - player.position.x) * 0.25;
+      player.position.y = -0.2 + Math.sin(state.clock.getElapsedTime() * 2) * 0.03;
+      player.rotation.y += (tx - player.position.x) * 0.1;
+      player.rotation.z = (tx - player.position.x) * 0.3;
+      
+      lastRot.copy(_euler);
+    }
+
+    // --- OBSTACLES & POOLING ---
+    function preloadObstacles() {
+      for (let i = 0; i < 30; i++) pool.push(createObstacleGroup(true));
+    }
+
+    function createObstacleGroup(isHidden) {
+      const grp = new THREE.Group();
+      const mesh = new THREE.Mesh(); // Empty mesh, populated on spawn
+      grp.add(mesh);
+      grp.position.set(0, isHidden ? -100 : -15, isHidden ? -100 : -15);
+      grp.visible = !isHidden;
+      scene.add(grp);
+      return { group: grp, mesh: mesh, inUse: !isHidden, type: 'crystal' };
+    }
+
+    function spawnObstacle() {
+      if (obstacles.length >= CONSTANTS.maxObstacles) return;
+      let obs = pool.find(o => !o.inUse);
+      if (!obs) { obs = createObstacleGroup(false); pool.push(obs); }
+      
+      // Calculate probability of a "bad" element spawning based on time played
+      const gameTime = state.clock.getElapsedTime() - state.gameStartTime;
+      // Chance starts at 0% and climbs to a maximum of 40% over 60 seconds
+      const badChance = Math.min(0.40, gameTime / 150.0);
+      const isBad = Math.random() < badChance;
+
+      obs.type = isBad ? 'bad' : 'crystal';
+
+      if (isBad) {
+        // Red corrupted crystal
+        obs.mesh.geometry = badGemGeo;
+        obs.mesh.material = badGemMat;
+        obs.mesh.scale.setScalar(1);
+      } else {
+        // Good collectible crystal
+        if (gemDataList.length > 0) {
+          const gem = gemDataList[Math.floor(Math.random() * gemDataList.length)];
+          obs.mesh.geometry = gem.geometry;
+          obs.mesh.material = gem.material;
+          obs.mesh.scale.setScalar(gem.scale);
+        } else {
+          // Safe fallback if gltf models are still loading
+          obs.mesh.geometry = badGemGeo;
+          obs.mesh.material = new THREE.MeshBasicMaterial({color: 0x3a70ff});
+        }
+      }
+
+      obs.inUse = true;
+      obs.group.position.set(CONSTANTS.lanes[Math.floor(Math.random()*3)], -0.2, -15);
+      // Give each a random initial rotation
+      obs.group.rotation.set(Math.random()*Math.PI, Math.random()*Math.PI, 0);
+      obs.group.visible = true;
+
+      obstacles.push(obs);
+    }
+
+    // --- EFFECTS & REUSABLE PARTICLES ---
+    function spawnParticle(pos, vel, life, scale, colorHSL) {
+      const p = particlePool.find(x => !x.active);
+      if (!p) return; 
+      p.active = true;
+      p.life = life;
+      p.vel.copy(vel);
+      p.mesh.position.copy(pos);
+      p.mesh.scale.setScalar(scale);
+      p.mesh.material.color.setHSL(colorHSL.h, colorHSL.s, colorHSL.l);
+      p.mesh.material.opacity = 0.85;
+      p.mesh.visible = true;
+    }
+
+    function triggerConfetti(ctrl) {
+      const pos = new THREE.Vector3(); ctrl.getWorldPosition(pos);
+      for (let i=0; i<40; i++) {
+        spawnParticle(
+          pos, 
+          new THREE.Vector3((Math.random()-.5)*.25, Math.random()*.3+.05, (Math.random()-.5)*.25), 
+          1.2+Math.random()*.6, 
+          0.01 + Math.random()*0.025, 
+          { h: Math.random(), s: 0.8, l: 0.7 }
+        );
+      }
+    }
+
+    function createTrail(pos, count) {
+      for (let i=0; i<count; i++) {
+        spawnParticle(
+          new THREE.Vector3().copy(pos).add(new THREE.Vector3((Math.random()-.5)*.1, (Math.random()-.5)*.1, (Math.random()-.5)*.1)), 
+          new THREE.Vector3((Math.random()-.5)*.03, Math.random()*.03, (Math.random()-.5)*.03), 
+          0.7+Math.random()*.3, 
+          0.01 + Math.random()*0.02, 
+          { h: Math.random(), s: 0.8, l: 0.7 }
+        );
+      }
+    }
+
+    // --- GAME LOOP ---
+    function checkCollisions() {
+      for (let i = obstacles.length-1; i >= 0; i--) {
+        const o = obstacles[i];
+        if (o.group.visible && player.position.distanceTo(o.group.position) < 0.25) {
+          
+          if (o.type === 'bad') {
+            // Hit an obstacle!
+            state.lives--; updateUI();
+            document.getElementById('glass-break-sound').play().catch(()=>{});
+            createTrail(player.position, 20); // Big Explosion
+            
+            state.speed = state.baseSpeed; // Reset speed penalty
+            player.children[0].material.color.set(state.lives <= 0 ? 0x666666 : 0xff6666);
+            
+            if (state.lives <= 0) {
+              state.isPlaying = false;
+              setTimeout(() => {
+                state.lives = 3; state.score = 0; state.speed = state.baseSpeed;
+                state.isFirstRun = false; state.gameStartTime = state.clock.getElapsedTime();
+                
+                obstacles.forEach(ob => { ob.inUse = false; ob.group.visible = false; });
+                obstacles = []; updateUI(); player.children[0].material.color.set(0x4da6ff);
+                state.isPlaying = true;
+              }, 4000); // 4 second restart loop
+            } else {
+              setTimeout(() => player.children[0].material.color.set(0x4da6ff), 1500);
+            }
+          } else {
+            // Collected a Crystal!
+            state.score++; updateUI();
+            createTrail(player.position, 8); // Happy Sparkle!
+            // Small scale bounce for feedback
+            player.scale.setScalar(1.2);
+            setTimeout(() => player.scale.setScalar(1.0), 150);
+          }
+
+          // In both cases, remove the object from play
+          o.inUse = false; o.group.visible = false;
+          obstacles.splice(i, 1);
+        }
+      }
+    }
+
+    function render(time, frame) {
+      const dt = Math.min(state.clock.getDelta(), 1/30);
+      if (!frame) return;
+
+      if (state.isControllerSelection) processControllerSelection();
+      else checkClap();
+
+      if (state.isPlaying && !state.isControllerSelection) {
+        handleSteering();
+        
+        const gameTime = state.clock.getElapsedTime() - state.gameStartTime;
+        const learnTime = state.isFirstRun ? CONSTANTS.learnTime : CONSTANTS.restartTime;
+        const canSpawn = gameTime > learnTime;
+
+        for (let i = obstacles.length-1; i >= 0; i--) {
+          const o = obstacles[i].group;
+          o.position.z += state.speed * dt; o.rotation.x += dt*.5; o.rotation.y += dt*.8;
+          
+          if (o.position.z > 1) {
+            // Passed the player without collecting/hitting
+            obstacles[i].inUse = false; o.visible = false; 
+            obstacles.splice(i, 1);
+            // Slowly increase speed over time (score is no longer incremented here)
+            if (canSpawn && state.lives > 0) { state.speed += 0.01; }
+          }
+        }
+
+        if (canSpawn && state.lives > 0 && state.clock.getElapsedTime() - state.lastSpawn > state.spawnInterval) {
+          spawnObstacle();
+          state.lastSpawn = state.clock.getElapsedTime();
+          state.spawnInterval = Math.max(0.8, state.spawnInterval - 0.02);
+        }
+
+        if (state.lives > 0) checkCollisions();
+      }
+
+      // Update Environment Particles
+      particles.forEach(p => {
+        p.position.y -= dt * 0.3;
+        if (p.position.y < -1) p.position.set((Math.random()-.5)*3, 1, -Math.random()*15);
+      });
+
+      // Update Pooled FX Particles
+      for(let i=0; i<particlePool.length; i++) {
+        const p = particlePool[i];
+        if (p.active) {
+          p.mesh.position.add(p.vel); p.life -= dt;
+          p.mesh.material.opacity = Math.max(0, p.life * 0.7);
+          if (p.life <= 0) { p.active = false; p.mesh.visible = false; }
+        }
+      }
+
+      renderer.render(scene, camera);
+    }
+
+    function clearScene() {
+      [player, ground, scorePanel].forEach(o => { if(o) scene.remove(o); });
+      [...obstacles, ...pool].forEach(o => scene.remove(o.group)); pool = []; obstacles = [];
+      
+      envObjects.forEach(o => {
+        if(o.isInstancedMesh) { o.geometry.dispose(); o.material.dispose(); }
+        scene.remove(o);
+      }); 
+      envObjects = [];
+      
+      particles.forEach(p => { scene.remove(p); p.geometry.dispose(); p.material.dispose(); });
+      particles = [];
+
+      particlePool.forEach(p => { p.active = false; p.mesh.visible = false; });
+    }
+  </script>
+</body>
+</html>
